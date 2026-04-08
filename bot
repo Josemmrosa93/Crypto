@@ -1,0 +1,1128 @@
+"""
+=============================================================================
+  ADAPTIVE GRID BOT v3 -- Crypto.com Exchange
+=============================================================================
+  Cambios respecto a v2:
+    [FIX] Logging compatible con Windows (cp1252 / cp850)
+          - FileHandler forzado a UTF-8
+          - StreamHandler con reconfigure a UTF-8 si es posible
+          - Todos los emojis sustituidos por prefijos ASCII
+            [OK] [WARN] [FAIL] [INFO] [BOT] [PRICE] [GRID] [ORDER]
+            [SIGNAL] [REGIME] [FEE] [BOOK] [OPEN] [CLOSE] [SWITCH]
+            [PNL] [BREAKOUT] [WAIT] [STOP]
+
+  Estrategia hibrida:
+    - LATERAL   -> Grid Trading (ordenes LIMIT -> maker fee)
+    - TENDENCIA -> RSI + EMA + MACD (ordenes MARKET -> taker fee)
+    - BREAKOUT  -> Posicion direccional (ordenes MARKET -> taker fee)
+
+  Deteccion de regimen: ADX + Bollinger Band Width combinados
+
+  Requisitos:
+    pip install requests pandas numpy python-dotenv
+
+  Variables de entorno (.env):
+    CDC_API_KEY=tu_api_key
+    CDC_API_SECRET=tu_api_secret
+=============================================================================
+"""
+
+# =============================================================================
+# BLOQUE 1 -- CONFIGURACION Y AUTENTICACION
+# =============================================================================
+
+import os
+import sys
+import time
+import hmac
+import hashlib
+import logging
+import math
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# -- Logging compatible con Windows --------------------------------------------
+# FileHandler: siempre UTF-8 para preservar tildes y caracteres especiales
+# StreamHandler: intenta reconfigurar stdout a UTF-8; si no puede, usa
+#                'backslashreplace' para evitar UnicodeEncodeError en cp1252
+_file_handler   = logging.FileHandler(
+    "adaptive_grid_bot_v3.log", encoding="utf-8"
+)
+_stream_handler = logging.StreamHandler(sys.stdout)
+
+# Python 3.7+ en Windows permite reconfigure; en versiones anteriores se ignora
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
+    except Exception:
+        pass
+
+_fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+_file_handler.setFormatter(_fmt)
+_stream_handler.setFormatter(_fmt)
+
+logging.basicConfig(level=logging.INFO, handlers=[_file_handler, _stream_handler])
+log = logging.getLogger(__name__)
+
+# -- Credenciales y URL base ---------------------------------------------------
+API_KEY    = os.getenv("CDC_API_KEY",    "TU_API_KEY")
+API_SECRET = os.getenv("CDC_API_SECRET", "TU_API_SECRET")
+BASE_URL   = "https://api.crypto.com/exchange/v1"
+
+# -- Parametros del bot --------------------------------------------------------
+CONFIG = {
+    # -- General
+    "symbol":               "BTC_USDT",
+    "timeframe":            "5m",
+    "capital_usdt":         1000.0,
+
+    # -- Comisiones (fallback si la API no las devuelve)
+    "fee_maker":            0.00050,   # 0.050% -> LIMIT
+    "fee_taker":            0.00075,   # 0.075% -> MARKET
+
+    # -- Slippage maximo aceptable antes de abortar la orden
+    "max_slippage_pct":     0.0015,    # 0.15%
+
+    # -- Order book
+    "book_depth":           10,
+    "min_liquidity_usdt":   500.0,
+
+    # -- Deteccion de regimen (ADX + BBW)
+    "adx_period":           14,
+    "adx_lateral_th":       25,        # ADX < 25  -> lateral
+    "adx_trend_th":         30,        # ADX > 30  -> tendencia
+    "bbw_period":           20,
+    "bbw_std":              2.0,
+    "bbw_squeeze_th":       0.03,      # BBW < 3%  -> squeeze (lateral)
+    "bbw_expand_th":        0.06,      # BBW > 6%  -> expansion (tendencia)
+    "regime_lookback":      3,
+
+    # -- Grid Trading (modo lateral)
+    "grid_levels":          8,
+    "grid_range_pct":       0.04,      # +/- 2% alrededor del precio central
+    "grid_order_usdt":      50.0,      # USDT por nivel
+    "grid_sl_pct":          0.035,     # SL global del grid (3.5% bajo el rango)
+
+    # -- Tendencia (RSI + EMA + MACD)
+    "trend_trade_pct":      0.10,      # % del capital por operacion
+    "sl_pct":               0.02,
+    "tp_pct":               0.04,
+    "rsi_period":           14,
+    "rsi_oversold":         30,
+    "rsi_overbought":       70,
+    "ema_fast":             9,
+    "ema_slow":             21,
+    "macd_fast":            12,
+    "macd_slow":            26,
+    "macd_signal":          9,
+
+    # -- Breakout
+    "breakout_confirm_candles": 2,
+    "breakout_volume_mult":     1.5,
+}
+
+TIMEFRAME_SECONDS = {
+    "1m": 60, "5m": 300, "15m": 900,
+    "30m": 1800, "1h": 3600, "4h": 14400,
+}
+
+log.info("[OK] Bloque 1 cargado -- Configuracion lista")
+log.info(
+    "     Comisiones -> Maker: %.3f%%  Taker: %.3f%%",
+    CONFIG["fee_maker"] * 100,
+    CONFIG["fee_taker"] * 100,
+)
+
+
+# =============================================================================
+# BLOQUE 2 -- CLIENTE API + PRECIO MID + ORDER BOOK + FEECALCULATOR
+# =============================================================================
+
+import requests
+
+
+class CryptoComClient:
+    """
+    Wrapper sobre la API REST v1 de Crypto.com Exchange.
+
+    Metodos principales:
+      get_mid_price()      -> (bid+ask)/2 en tiempo real
+      get_order_book()     -> niveles bid/ask del libro
+      estimate_slippage()  -> impacto estimado de una orden MARKET en el libro
+      get_fee_rate()       -> fees reales del usuario desde la API
+    """
+
+    def __init__(self, api_key, api_secret, base_url):
+        self.api_key    = api_key
+        self.api_secret = api_secret
+        self.base_url   = base_url
+        self.session    = requests.Session()
+        self.session.headers.update({"Content-Type": "application/json"})
+
+    # -- Firma HMAC-SHA256 ----------------------------------------------------
+    def _sign(self, method, params, nonce):
+        param_str = "".join(f"{k}{v}" for k, v in sorted(params.items()))
+        payload   = f"{method}{self.api_key}{param_str}{nonce}"
+        return hmac.new(
+            self.api_secret.encode(), payload.encode(), hashlib.sha256
+        ).hexdigest()
+
+    def _private(self, method, params=None):
+        params = params or {}
+        nonce  = int(time.time() * 1000)
+        body   = {
+            "id":      nonce,
+            "method":  method,
+            "api_key": self.api_key,
+            "params":  params,
+            "nonce":   nonce,
+            "sig":     self._sign(method, params, nonce),
+        }
+        url  = f"{self.base_url}/private/{method.split('/')[-1]}"
+        resp = self.session.post(url, json=body, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("code") != 0:
+            raise RuntimeError(f"API {data.get('code')}: {data.get('message')}")
+        return data.get("result", {})
+
+    def _public(self, endpoint, params=None):
+        url  = f"{self.base_url}/public/{endpoint}"
+        resp = self.session.get(url, params=params, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("code") != 0:
+            raise RuntimeError(f"API {data.get('code')}: {data.get('message')}")
+        return data.get("result", {})
+
+    # -- Mercado --------------------------------------------------------------
+    def get_candlesticks(self, symbol, timeframe, count=100):
+        return self._public("get-candlestick", {
+            "instrument_name": symbol,
+            "timeframe":       timeframe,
+            "count":           count,
+        }).get("data", [])
+
+    def get_ticker(self, symbol):
+        """Ticker completo: bid (b), ask (a), last (k), vol 24h (v)."""
+        return self._public(
+            "get-ticker", {"instrument_name": symbol}
+        ).get("data", [{}])[0]
+
+    def get_mid_price(self, symbol):
+        """
+        Precio mid real = (mejor_bid + mejor_ask) / 2.
+        Devuelve (mid, bid, ask).
+        Mas preciso que el cierre de la ultima vela.
+        """
+        ticker = self.get_ticker(symbol)
+        bid    = float(ticker.get("b", 0) or 0)
+        ask    = float(ticker.get("a", 0) or 0)
+        if bid <= 0 or ask <= 0:
+            last = float(ticker.get("k", 0) or 0)
+            return last, last, last
+        mid = (bid + ask) / 2
+        return round(mid, 2), round(bid, 2), round(ask, 2)
+
+    def get_order_book(self, symbol, depth=10):
+        """
+        Libro de ordenes con `depth` niveles.
+        Devuelve {"bids": [[price, qty], ...], "asks": [[price, qty], ...]}
+        """
+        raw  = self._public("get-book", {
+            "instrument_name": symbol,
+            "depth":           depth,
+        })
+        bids = [[float(x[0]), float(x[1])] for x in raw.get("bids", [])]
+        asks = [[float(x[0]), float(x[1])] for x in raw.get("asks", [])]
+        return {"bids": bids, "asks": asks}
+
+    def estimate_slippage(self, symbol, side, usdt_amount, max_slip_pct):
+        """
+        Simula el impacto de una orden MARKET en el libro real.
+        - BUY  -> consume asks de menor a mayor precio
+        - SELL -> consume bids de mayor a menor precio
+        Devuelve (precio_medio_ejecucion, slippage_pct, es_aceptable).
+        """
+        book       = self.get_order_book(symbol, depth=CONFIG["book_depth"])
+        levels     = book["asks"] if side == "BUY" else book["bids"]
+        best_price = levels[0][0] if levels else 0
+
+        if not levels or best_price == 0:
+            log.warning("[WARN] [BOOK] Libro vacio, no se puede estimar slippage")
+            return best_price, 0.0, True
+
+        remaining = usdt_amount
+        total_qty  = 0.0
+        total_cost = 0.0
+
+        for price, qty in levels:
+            level_usdt = price * qty
+            if level_usdt >= remaining:
+                fill        = remaining / price
+                total_qty  += fill
+                total_cost += fill * price
+                remaining   = 0
+                break
+            else:
+                total_qty  += qty
+                total_cost += qty * price
+                remaining  -= level_usdt
+
+        if remaining > 0:
+            pct = (usdt_amount - remaining) / usdt_amount * 100
+            log.warning(
+                "[WARN] [BOOK] Liquidez insuficiente. Solo se cubriria el %.1f%% de la orden",
+                pct,
+            )
+            return best_price, 0.0, False
+
+        avg   = total_cost / total_qty if total_qty > 0 else best_price
+        slip  = abs(avg - best_price) / best_price
+        is_ok = slip <= max_slip_pct
+
+        log.info(
+            "[BOOK] [%s] %.0f USDT | Top=%.2f | Ejecucion~%.2f | Slippage=%.3f%% [%s]",
+            side, usdt_amount, best_price, avg, slip * 100,
+            "OK" if is_ok else "EXCEDE LIMITE",
+        )
+        return round(avg, 2), round(slip, 6), is_ok
+
+    # -- Cuenta ---------------------------------------------------------------
+    def get_fee_rate(self, symbol):
+        """
+        Fees reales del usuario desde private/get-fee-rate.
+        Devuelve {"maker": float, "taker": float} en decimal, o None si falla.
+        Las fees varian segun volumen 30d y staking de CRO.
+        """
+        try:
+            result    = self._private("private/get-fee-rate", {
+                "instrument_name": symbol,
+            })
+            maker_str = result.get("maker_rate", result.get("maker", "0.050"))
+            taker_str = result.get("taker_rate", result.get("taker", "0.075"))
+            maker     = float(maker_str) / 100
+            taker     = float(taker_str) / 100
+            log.info(
+                "[OK] Fees reales de la API -> Maker: %.4f%%  Taker: %.4f%%",
+                maker * 100, taker * 100,
+            )
+            return {"maker": maker, "taker": taker}
+        except Exception as exc:
+            log.warning(
+                "[WARN] No se pudieron obtener fees de la API (%s). Usando CONFIG.", exc
+            )
+            return None
+
+    def get_balance(self, currency="USDT"):
+        result = self._private(
+            "private/get-account-summary", {"currency": currency}
+        )
+        for acc in result.get("accounts", []):
+            if acc.get("currency") == currency:
+                return float(acc.get("available", 0))
+        return 0.0
+
+    def get_open_orders(self, symbol):
+        return self._private("private/get-open-orders", {
+            "instrument_name": symbol,
+            "page_size":       50,
+        }).get("order_list", [])
+
+    # -- Ordenes --------------------------------------------------------------
+    def place_order(self, symbol, side, order_type, quantity,
+                    price=None, client_oid=None):
+        params = {
+            "instrument_name": symbol,
+            "side":            side,
+            "type":            order_type,
+            "quantity":        str(round(quantity, 6)),
+        }
+        if price and order_type == "LIMIT":
+            params["price"] = str(round(price, 2))
+        if client_oid:
+            params["client_oid"] = client_oid
+        return self._private("private/create-order", params)
+
+    def cancel_order(self, symbol, order_id):
+        return self._private("private/cancel-order", {
+            "instrument_name": symbol,
+            "order_id":        order_id,
+        })
+
+    def cancel_all_orders(self, symbol):
+        return self._private("private/cancel-all-orders", {
+            "instrument_name": symbol,
+        })
+
+
+# -- Calculadora de costes ----------------------------------------------------
+class FeeCalculator:
+    """
+    Calcula costes reales de cada operacion:
+      - Comision maker (LIMIT) o taker (MARKET)
+      - Slippage estimado del order book
+      - PnL neto tras todos los costes
+
+    Al iniciarse consulta las fees reales de la API.
+    Si falla, usa los valores del CONFIG como fallback.
+    """
+
+    def __init__(self, cfg, api_client=None):
+        real_fees = api_client.get_fee_rate(cfg["symbol"]) if api_client else None
+
+        if real_fees:
+            self.fee_maker = real_fees["maker"]
+            self.fee_taker = real_fees["taker"]
+            self.source    = "API"
+        else:
+            self.fee_maker = cfg["fee_maker"]
+            self.fee_taker = cfg["fee_taker"]
+            self.source    = "CONFIG (fallback)"
+
+        log.info(
+            "[FEE] FeeCalculator [%s] -> Maker=%.4f%%  Taker=%.4f%%",
+            self.source, self.fee_maker * 100, self.fee_taker * 100,
+        )
+
+    def fee_rate(self, order_type):
+        return self.fee_maker if order_type == "LIMIT" else self.fee_taker
+
+    def calc_entry_cost(self, usdt_amount, exec_price, order_type, slippage_pct=0.0):
+        """
+        Coste de ENTRADA.
+        Devuelve dict: qty, fee_usdt, slippage_usdt, total_cost,
+                       effective_price, fee_rate, fee_type.
+        """
+        rate  = self.fee_rate(order_type)
+        eff   = exec_price * (1 + slippage_pct) if order_type == "MARKET" else exec_price
+        qty   = usdt_amount / eff
+        fee   = usdt_amount * rate
+        slip  = usdt_amount * slippage_pct if order_type == "MARKET" else 0.0
+        return {
+            "qty":             round(qty, 8),
+            "fee_usdt":        round(fee, 6),
+            "slippage_usdt":   round(slip, 6),
+            "total_cost":      round(usdt_amount + fee, 6),
+            "effective_price": round(eff, 2),
+            "fee_rate":        rate,
+            "fee_type":        "maker" if order_type == "LIMIT" else "taker",
+        }
+
+    def calc_exit_cost(self, qty, exec_price, order_type, slippage_pct=0.0):
+        """
+        Coste de SALIDA.
+        Devuelve dict: gross_usdt, fee_usdt, slippage_usdt, net_usdt,
+                       effective_price, fee_rate, fee_type.
+        """
+        rate  = self.fee_rate(order_type)
+        eff   = exec_price * (1 - slippage_pct) if order_type == "MARKET" else exec_price
+        gross = qty * eff
+        fee   = gross * rate
+        slip  = qty * exec_price * slippage_pct if order_type == "MARKET" else 0.0
+        return {
+            "gross_usdt":      round(gross, 6),
+            "fee_usdt":        round(fee, 6),
+            "slippage_usdt":   round(slip, 6),
+            "net_usdt":        round(gross - fee, 6),
+            "effective_price": round(eff, 2),
+            "fee_rate":        rate,
+            "fee_type":        "maker" if order_type == "LIMIT" else "taker",
+        }
+
+    def min_move_to_profit(self, order_type_entry, order_type_exit):
+        """Movimiento minimo (%) para cubrir fees de entrada y salida."""
+        return round((self.fee_rate(order_type_entry) + self.fee_rate(order_type_exit)) * 100, 4)
+
+    def log_summary(self, direction, entry, exit_info=None):
+        log.info(
+            "[FEE] Entrada [%s] %.3f%% = %.4f USDT | Slippage = %.4f USDT | Precio eff = %.2f",
+            entry["fee_type"], entry["fee_rate"] * 100,
+            entry["fee_usdt"], entry["slippage_usdt"], entry["effective_price"],
+        )
+        if exit_info:
+            log.info(
+                "[FEE] Salida  [%s] %.3f%% = %.4f USDT | Neto recibido = %.4f USDT",
+                exit_info["fee_type"], exit_info["fee_rate"] * 100,
+                exit_info["fee_usdt"], exit_info["net_usdt"],
+            )
+
+
+client = CryptoComClient(API_KEY, API_SECRET, BASE_URL)
+fees   = FeeCalculator(CONFIG, api_client=client)
+
+log.info("[OK] Bloque 2 cargado -- Cliente API + FeeCalculator listos")
+log.info(
+    "     Breakeven minimo -> Grid (maker+maker): %.4f%%  Tendencia (taker+taker): %.4f%%",
+    fees.min_move_to_profit("LIMIT",  "LIMIT"),
+    fees.min_move_to_profit("MARKET", "MARKET"),
+)
+
+
+# =============================================================================
+# BLOQUE 3 -- DETECTOR DE REGIMEN (ADX + BBW)
+# =============================================================================
+
+import pandas as pd
+import numpy as np
+
+REGIME_LATERAL  = "LATERAL"
+REGIME_TREND_UP = "TREND_UP"
+REGIME_TREND_DN = "TREND_DOWN"
+REGIME_BREAKOUT = "BREAKOUT"
+
+
+class RegimeDetector:
+    """
+    Clasifica el mercado combinando ADX y Bollinger Band Width.
+
+    LATERAL:   ADX < 25 Y BBW < 3%
+    TENDENCIA: ADX > 30 O BBW > 6%
+    BREAKOUT:  mid_price fuera del rango del grid activo + volumen elevado
+
+    El regimen se suaviza con un historial de N velas para evitar ruido.
+    """
+
+    def __init__(self, cfg):
+        self.cfg       = cfg
+        self._history  = []
+        self.grid_high = None
+        self.grid_low  = None
+
+    def build_df(self, candles):
+        df = pd.DataFrame(candles, columns=["t", "o", "h", "l", "c", "v"])
+        for col in ["o", "h", "l", "c", "v"]:
+            df[col] = pd.to_numeric(df[col])
+        df["t"] = pd.to_numeric(df["t"])
+        return df.sort_values("t").reset_index(drop=True)
+
+    def _adx(self, df, period):
+        high, low, close = df["h"], df["l"], df["c"]
+        tr = pd.concat([
+            high - low,
+            (high - close.shift()).abs(),
+            (low  - close.shift()).abs(),
+        ], axis=1).max(axis=1)
+        dm_pos = (high - high.shift()).clip(lower=0)
+        dm_neg = (low.shift() - low).clip(lower=0)
+        dm_pos = dm_pos.where(dm_pos > dm_neg, 0)
+        dm_neg = dm_neg.where(dm_neg > dm_pos, 0)
+        atr    = tr.ewm(span=period, adjust=False).mean()
+        di_pos = 100 * dm_pos.ewm(span=period, adjust=False).mean() / atr
+        di_neg = 100 * dm_neg.ewm(span=period, adjust=False).mean() / atr
+        dx     = 100 * (di_pos - di_neg).abs() / (di_pos + di_neg).replace(0, np.nan)
+        return dx.ewm(span=period, adjust=False).mean(), di_pos, di_neg
+
+    def _bbw(self, df, period, std_mult):
+        sma   = df["c"].rolling(period).mean()
+        std   = df["c"].rolling(period).std()
+        upper = sma + std_mult * std
+        lower = sma - std_mult * std
+        return (upper - lower) / sma, upper, lower
+
+    def detect(self, df, mid_price):
+        """
+        Devuelve (regime_final, adx_val, bbw_val).
+        Usa mid_price real del ticker para detectar breakouts.
+        """
+        adx, di_pos, di_neg = self._adx(df, self.cfg["adx_period"])
+        bbw, _, _            = self._bbw(df, self.cfg["bbw_period"], self.cfg["bbw_std"])
+        vol_mean             = df["v"].rolling(20).mean()
+
+        adx_val = adx.iloc[-1]
+        bbw_val = bbw.iloc[-1]
+        cur_vol = df["v"].iloc[-1]
+
+        adx_lateral  = adx_val < self.cfg["adx_lateral_th"]
+        adx_trending = adx_val > self.cfg["adx_trend_th"]
+        bbw_squeeze  = bbw_val < self.cfg["bbw_squeeze_th"]
+        bbw_expand   = bbw_val > self.cfg["bbw_expand_th"]
+        vol_spike    = cur_vol > vol_mean.iloc[-1] * self.cfg["breakout_volume_mult"]
+        trend_up     = di_pos.iloc[-1] > di_neg.iloc[-1]
+
+        # Breakout: precio mid fuera del rango del grid activo
+        breakout = False
+        if self.grid_high and self.grid_low:
+            outside = mid_price > self.grid_high or mid_price < self.grid_low
+            if outside and vol_spike:
+                n       = self.cfg["breakout_confirm_candles"]
+                recent  = df["c"].iloc[-n:]
+                all_out = all(c > self.grid_high or c < self.grid_low for c in recent)
+                breakout = all_out
+
+        if breakout:
+            regime = REGIME_BREAKOUT
+        elif adx_trending or bbw_expand:
+            regime = REGIME_TREND_UP if trend_up else REGIME_TREND_DN
+        elif adx_lateral and bbw_squeeze:
+            regime = REGIME_LATERAL
+        else:
+            regime = self._history[-1] if self._history else REGIME_LATERAL
+
+        self._history.append(regime)
+        if len(self._history) > self.cfg["regime_lookback"]:
+            self._history.pop(0)
+
+        from collections import Counter
+        regime_final = Counter(self._history).most_common(1)[0][0]
+
+        log.info(
+            "[REGIME] %-12s | ADX=%.1f | BBW=%.2f%% | Mid=%.2f",
+            regime_final, adx_val, bbw_val * 100, mid_price,
+        )
+        return regime_final, adx_val, bbw_val
+
+
+detector = RegimeDetector(CONFIG)
+log.info("[OK] Bloque 3 cargado -- Detector de regimen listo")
+
+
+# =============================================================================
+# BLOQUE 4 -- GRID ENGINE (MODO LATERAL)
+# =============================================================================
+
+class GridEngine:
+    """
+    Grid Trading con ordenes LIMIT (fee maker).
+
+    - Construye N niveles equidistantes en rango +/- X% alrededor del mid.
+    - Verifica que el paso entre niveles supera el breakeven de comisiones.
+    - Cuando se ejecuta una orden, coloca la contraria en el nivel adyacente.
+    - SL global si el mid cae por debajo de grid_low * (1 - grid_sl_pct).
+    - Todo el PnL registrado es NETO (descontando fees maker de entrada y salida).
+    """
+
+    def __init__(self, cfg, api_client, fee_calc):
+        self.cfg             = cfg
+        self.client          = api_client
+        self.fees            = fee_calc
+        self.active          = False
+        self.levels          = []
+        self.orders          = {}   # {order_id: {level, side, qty, fee_usdt}}
+        self.center          = None
+        self.grid_low        = None
+        self.grid_high       = None
+        self.sl_price        = None
+        self.realized_pnl    = 0.0
+        self.total_fees_paid = 0.0
+
+    def _check_viable(self, n_levels, range_pct):
+        step_pct  = range_pct / (n_levels - 1)
+        breakeven = 2 * self.fees.fee_maker
+        if step_pct <= breakeven:
+            log.warning(
+                "[WARN] [GRID] Inviable: paso=%.4f%% <= breakeven=%.4f%% (2x maker). "
+                "Aumenta grid_range_pct o reduce grid_levels.",
+                step_pct * 100, breakeven * 100,
+            )
+            return False
+        log.info(
+            "[OK] [GRID] Viable: paso=%.4f%% > breakeven=%.4f%% | "
+            "Margen neto por ciclo ~%.4f%%",
+            step_pct * 100, breakeven * 100, (step_pct - breakeven) * 100,
+        )
+        return True
+
+    def setup(self, center_price):
+        if not self._check_viable(self.cfg["grid_levels"], self.cfg["grid_range_pct"]):
+            return False
+        half           = center_price * self.cfg["grid_range_pct"] / 2
+        self.center    = center_price
+        self.grid_low  = round(center_price - half, 2)
+        self.grid_high = round(center_price + half, 2)
+        self.sl_price  = round(self.grid_low * (1 - self.cfg["grid_sl_pct"]), 2)
+        step           = (self.grid_high - self.grid_low) / (self.cfg["grid_levels"] - 1)
+        self.levels    = [
+            round(self.grid_low + i * step, 2) for i in range(self.cfg["grid_levels"])
+        ]
+        log.info(
+            "[GRID] Configurado: [%.2f -- %.2f] | Centro=%.2f | Paso=%.2f | SL=%.2f",
+            self.grid_low, self.grid_high, center_price, step, self.sl_price,
+        )
+        return True
+
+    def place_initial_orders(self, mid_price):
+        """Coloca ordenes LIMIT en todos los niveles segun el mid real."""
+        symbol    = self.cfg["symbol"]
+        order_usd = self.cfg["grid_order_usdt"]
+
+        for level in self.levels:
+            if abs(level - mid_price) / mid_price < 0.001:
+                continue
+            side   = "BUY" if level < mid_price else "SELL"
+            costs  = self.fees.calc_entry_cost(order_usd, level, "LIMIT")
+            try:
+                result = self.client.place_order(
+                    symbol, side, "LIMIT", costs["qty"], price=level,
+                    client_oid=f"grid_{side}_{int(level)}_{int(time.time())}",
+                )
+                oid = result.get("order_id", "")
+                self.orders[oid] = {
+                    "level":    level,
+                    "side":     side,
+                    "qty":      costs["qty"],
+                    "fee_usdt": costs["fee_usdt"],
+                }
+                log.info(
+                    "[ORDER] %s LIMIT @ %.2f | Qty=%.6f | Fee=%.4f USDT [maker]",
+                    side, level, costs["qty"], costs["fee_usdt"],
+                )
+            except Exception as exc:
+                log.error("[FAIL] Orden grid @ %.2f: %s", level, exc)
+
+        self.active = True
+
+    def refresh(self, mid_price, open_order_ids):
+        """Detecta ordenes ejecutadas y coloca la contraria."""
+        if not self.active:
+            return
+        symbol    = self.cfg["symbol"]
+        order_usd = self.cfg["grid_order_usdt"]
+        executed  = {oid: o for oid, o in self.orders.items()
+                     if oid not in open_order_ids}
+
+        for oid, order in executed.items():
+            level = order["level"]
+            side  = order["side"]
+            try:
+                idx = self.levels.index(level)
+            except ValueError:
+                del self.orders[oid]
+                continue
+
+            if side == "BUY" and idx + 1 < len(self.levels):
+                next_level, next_side = self.levels[idx + 1], "SELL"
+            elif side == "SELL" and idx - 1 >= 0:
+                next_level, next_side = self.levels[idx - 1], "BUY"
+            else:
+                del self.orders[oid]
+                continue
+
+            fee_exit   = self.fees.calc_exit_cost(order["qty"], next_level, "LIMIT")
+            cycle_pnl  = (abs(next_level - level) * order["qty"]
+                          - order["fee_usdt"] - fee_exit["fee_usdt"])
+            self.realized_pnl    += cycle_pnl
+            self.total_fees_paid += order["fee_usdt"] + fee_exit["fee_usdt"]
+
+            log.info(
+                "[OK] [GRID] Ejecutada %s @ %.2f | PnL ciclo neto=%+.4f USDT | "
+                "Acumulado=%+.4f USDT",
+                side, level, cycle_pnl, self.realized_pnl,
+            )
+
+            next_costs = self.fees.calc_entry_cost(order_usd, next_level, "LIMIT")
+            try:
+                result = self.client.place_order(
+                    symbol, next_side, "LIMIT", next_costs["qty"], price=next_level,
+                    client_oid=f"grid_{next_side}_{int(next_level)}_{int(time.time())}",
+                )
+                new_id = result.get("order_id", "")
+                self.orders[new_id] = {
+                    "level":    next_level,
+                    "side":     next_side,
+                    "qty":      next_costs["qty"],
+                    "fee_usdt": next_costs["fee_usdt"],
+                }
+                log.info(
+                    "[ORDER] %s LIMIT @ %.2f [maker]", next_side, next_level
+                )
+            except Exception as exc:
+                log.error("[FAIL] Orden contraria @ %.2f: %s", next_level, exc)
+
+            del self.orders[oid]
+
+    def check_sl(self, mid_price):
+        """SL global del grid evaluado sobre el mid real del ticker."""
+        if self.sl_price and mid_price < self.sl_price:
+            log.warning(
+                "[STOP] [GRID] SL activado | Mid=%.2f < SL=%.2f | "
+                "PnL realizado=%+.4f USDT | Fees=%.4f USDT",
+                mid_price, self.sl_price, self.realized_pnl, self.total_fees_paid,
+            )
+            return True
+        return False
+
+    def close(self):
+        try:
+            self.client.cancel_all_orders(self.cfg["symbol"])
+        except Exception as exc:
+            log.error("[FAIL] Cancelando ordenes grid: %s", exc)
+        log.info(
+            "[CLOSE] [GRID] Cerrado | PnL neto=%+.4f USDT | Fees=%.4f USDT",
+            self.realized_pnl, self.total_fees_paid,
+        )
+        self.orders          = {}
+        self.active          = False
+        self.realized_pnl    = 0.0
+        self.total_fees_paid = 0.0
+
+
+grid_engine = GridEngine(CONFIG, client, fees)
+log.info("[OK] Bloque 4 cargado -- Grid Engine listo")
+
+
+# =============================================================================
+# BLOQUE 5 -- ESTRATEGIA DE TENDENCIA (RSI + EMA + MACD)
+# =============================================================================
+
+class TrendStrategy:
+    """
+    Seguimiento de tendencia con costes reales.
+
+    Ordenes MARKET -> fee taker (0.075%).
+    Antes de abrir, consulta el order book para estimar slippage.
+    SL/TP calculados sobre el precio efectivo real (post-slippage).
+    PnL neto descuenta fees de entrada y salida.
+    """
+
+    def __init__(self, cfg, api_client, fee_calc):
+        self.cfg             = cfg
+        self.client          = api_client
+        self.fees            = fee_calc
+        self.position        = None
+        self.total_fees_paid = 0.0
+
+    def _indicators(self, df):
+        c     = df["c"]
+        delta = c.diff()
+        gain  = delta.clip(lower=0).rolling(self.cfg["rsi_period"]).mean()
+        loss  = (-delta.clip(upper=0)).rolling(self.cfg["rsi_period"]).mean()
+        rsi   = 100 - (100 / (1 + gain / loss.replace(0, np.nan)))
+        ema_f = c.ewm(span=self.cfg["ema_fast"], adjust=False).mean()
+        ema_s = c.ewm(span=self.cfg["ema_slow"], adjust=False).mean()
+        fast  = c.ewm(span=self.cfg["macd_fast"], adjust=False).mean()
+        slow  = c.ewm(span=self.cfg["macd_slow"], adjust=False).mean()
+        macd  = fast - slow
+        sig   = macd.ewm(span=self.cfg["macd_signal"], adjust=False).mean()
+        return rsi, ema_f, ema_s, macd, sig
+
+    def get_signal(self, df):
+        rsi, ema_f, ema_s, macd, sig = self._indicators(df)
+
+        rsi_buy   = rsi.iloc[-1]   < self.cfg["rsi_oversold"]
+        rsi_sell  = rsi.iloc[-1]   > self.cfg["rsi_overbought"]
+        ema_buy   = ema_f.iloc[-2] <= ema_s.iloc[-2] and ema_f.iloc[-1] > ema_s.iloc[-1]
+        ema_sell  = ema_f.iloc[-2] >= ema_s.iloc[-2] and ema_f.iloc[-1] < ema_s.iloc[-1]
+        macd_buy  = macd.iloc[-2]  <= sig.iloc[-2]   and macd.iloc[-1]  > sig.iloc[-1]
+        macd_sell = macd.iloc[-2]  >= sig.iloc[-2]   and macd.iloc[-1]  < sig.iloc[-1]
+
+        buy_score  = sum([rsi_buy,  ema_buy,  macd_buy])
+        sell_score = sum([rsi_sell, ema_sell, macd_sell])
+
+        log.info(
+            "[SIGNAL] RSI=%.1f | EMA %.0f/%.0f | MACD %.1f/Sig %.1f | "
+            "Score BUY=%d/3 SELL=%d/3",
+            rsi.iloc[-1], ema_f.iloc[-1], ema_s.iloc[-1],
+            macd.iloc[-1], sig.iloc[-1], buy_score, sell_score,
+        )
+        if   buy_score  >= 2: return "BUY"
+        elif sell_score >= 2: return "SELL"
+        return "NEUTRAL"
+
+    def open(self, signal, mid_price, bid, ask, capital):
+        if self.position:
+            return
+
+        trade_usdt = capital * self.cfg["trend_trade_pct"]
+
+        # 1. Estimar slippage desde el order book
+        exec_price, slip_pct, slip_ok = self.client.estimate_slippage(
+            self.cfg["symbol"], signal, trade_usdt, self.cfg["max_slippage_pct"]
+        )
+        if not slip_ok:
+            log.warning(
+                "[WARN] Slippage excesivo (%.3f%%) -- orden abortada", slip_pct * 100
+            )
+            return
+
+        # 2. Costes de entrada (taker)
+        entry = self.fees.calc_entry_cost(
+            trade_usdt, exec_price, "MARKET", slip_pct
+        )
+
+        # 3. SL/TP sobre el precio efectivo real
+        eff = entry["effective_price"]
+        sl  = eff * (1 - self.cfg["sl_pct"]) if signal == "BUY" else eff * (1 + self.cfg["sl_pct"])
+        tp  = eff * (1 + self.cfg["tp_pct"]) if signal == "BUY" else eff * (1 - self.cfg["tp_pct"])
+
+        # 4. Avisar si el TP no cubre el breakeven de fees
+        min_move = self.fees.min_move_to_profit("MARKET", "MARKET") / 100
+        if self.cfg["tp_pct"] <= min_move:
+            log.warning(
+                "[WARN] TP (%.2f%%) <= breakeven fees (%.3f%%) -- considera aumentar tp_pct",
+                self.cfg["tp_pct"] * 100, min_move * 100,
+            )
+
+        # 5. Ejecutar orden
+        try:
+            result = self.client.place_order(
+                self.cfg["symbol"], signal, "MARKET", entry["qty"],
+                client_oid=f"trend_{signal}_{int(time.time())}",
+            )
+            self.position = {
+                "side":       signal,
+                "entry":      eff,
+                "qty":        entry["qty"],
+                "sl":         round(sl, 2),
+                "tp":         round(tp, 2),
+                "trade_usdt": trade_usdt,
+                "fee_entry":  entry["fee_usdt"],
+                "slip_entry": entry["slippage_usdt"],
+            }
+            self.total_fees_paid += entry["fee_usdt"]
+            self.fees.log_summary(signal, entry)
+            log.info(
+                "[OPEN] [%s] Entry=%.2f | SL=%.2f | TP=%.2f | "
+                "Qty=%.6f | ID=%s",
+                signal, eff, sl, tp, entry["qty"], result.get("order_id", ""),
+            )
+        except Exception as exc:
+            log.error("[FAIL] Abriendo tendencia: %s", exc)
+
+    def check_exit(self, mid_price):
+        """Evalua SL/TP sobre el mid real del ticker."""
+        if not self.position:
+            return None
+        side = self.position["side"]
+        if side == "BUY":
+            if mid_price <= self.position["sl"]: return "SL"
+            if mid_price >= self.position["tp"]: return "TP"
+        else:
+            if mid_price >= self.position["sl"]: return "SL"
+            if mid_price <= self.position["tp"]: return "TP"
+        return None
+
+    def close(self, mid_price, bid, ask, reason=""):
+        if not self.position:
+            return
+
+        close_side = "SELL" if self.position["side"] == "BUY" else "BUY"
+
+        # Slippage de salida (umbral mas permisivo en cierre)
+        exit_exec, exit_slip, _ = self.client.estimate_slippage(
+            self.cfg["symbol"], close_side,
+            self.position["qty"] * mid_price,
+            self.cfg["max_slippage_pct"] * 2,
+        )
+        exit_costs = self.fees.calc_exit_cost(
+            self.position["qty"], exit_exec, "MARKET", exit_slip
+        )
+
+        entry = self.position["entry"]
+        qty   = self.position["qty"]
+        if self.position["side"] == "BUY":
+            gross = (exit_costs["effective_price"] - entry) * qty
+        else:
+            gross = (entry - exit_costs["effective_price"]) * qty
+
+        total_fees = self.position["fee_entry"] + exit_costs["fee_usdt"]
+        net_pnl    = gross - total_fees
+        self.total_fees_paid += exit_costs["fee_usdt"]
+
+        tag = "[OK]" if reason == "TP" else "[FAIL]" if reason == "SL" else "[INFO]"
+        try:
+            self.client.place_order(
+                self.cfg["symbol"], close_side, "MARKET", qty,
+            )
+            log.info(
+                "%s [CLOSE] [%s] Entry=%.2f Exit~%.2f | "
+                "PnL bruto=%+.4f Fees=%.4f PnL neto=%+.4f USDT",
+                tag, reason, entry, exit_costs["effective_price"],
+                gross, total_fees, net_pnl,
+            )
+            self.fees.log_summary(close_side, exit_costs)
+        except Exception as exc:
+            log.error("[FAIL] Cerrando tendencia: %s", exc)
+
+        self.position = None
+
+    def unrealized_pnl(self, mid_price):
+        if not self.position:
+            return 0.0
+        pos = self.position
+        gross = ((mid_price - pos["entry"]) if pos["side"] == "BUY"
+                 else (pos["entry"] - mid_price)) * pos["qty"]
+        return round(gross - pos["fee_entry"], 4)
+
+
+trend_strategy = TrendStrategy(CONFIG, client, fees)
+log.info("[OK] Bloque 5 cargado -- Estrategia de tendencia lista")
+
+
+# =============================================================================
+# BLOQUE 6 -- ORQUESTADOR PRINCIPAL (BUCLE ADAPTATIVO)
+# =============================================================================
+
+class AdaptiveGridBot:
+    """
+    Coordina los bloques anteriores en un bucle continuo.
+
+    Cada ciclo:
+      1. Obtiene mid/bid/ask del ticker en tiempo real
+      2. Descarga candlesticks y detecta el regimen (ADX + BBW)
+      3. Si LATERAL  -> mantiene o activa el grid
+      4. Si TENDENCIA/BREAKOUT -> opera con RSI+EMA+MACD o direccion directa
+      5. Gestiona transiciones limpias entre modos
+      6. Cierre limpio al parar (Ctrl+C)
+    """
+
+    def __init__(self, cfg, api_client, detector, grid, trend):
+        self.cfg      = cfg
+        self.client   = api_client
+        self.detector = detector
+        self.grid     = grid
+        self.trend    = trend
+        self.symbol   = cfg["symbol"]
+        self.interval = TIMEFRAME_SECONDS.get(cfg["timeframe"], 300)
+        self.regime   = None
+        self.running  = False
+
+    def _switch_to_lateral(self, mid, bid, ask):
+        if self.trend.position:
+            log.info("[SWITCH] TREND -> LATERAL | Cerrando posicion...")
+            self.trend.close(mid, bid, ask, reason="REGIME_CHANGE")
+        if not self.grid.active:
+            ok = self.grid.setup(mid)
+            if ok:
+                self.detector.grid_high = self.grid.grid_high
+                self.detector.grid_low  = self.grid.grid_low
+                self.grid.place_initial_orders(mid)
+
+    def _switch_to_trend(self, new_regime):
+        if self.grid.active:
+            log.info("[SWITCH] LATERAL -> %s | Cerrando grid...", new_regime)
+            self.grid.close()
+            self.detector.grid_high = None
+            self.detector.grid_low  = None
+
+    def run(self):
+        log.info(
+            "[BOT] Adaptive Grid Bot v3 | %s | %s | "
+            "Precio referencia: mid=(bid+ask)/2 en tiempo real",
+            self.symbol, self.cfg["timeframe"],
+        )
+        self.running = True
+
+        while self.running:
+            try:
+                log.info("-" * 65)
+
+                # 1. Precio mid real del ticker
+                mid, bid, ask = self.client.get_mid_price(self.symbol)
+                spread_pct    = (ask - bid) / mid * 100 if mid > 0 else 0
+                log.info(
+                    "[PRICE] Mid=%.2f | Bid=%.2f | Ask=%.2f | Spread=%.4f%%",
+                    mid, bid, ask, spread_pct,
+                )
+                if spread_pct > 0.05:
+                    log.warning(
+                        "[WARN] Spread elevado (%.4f%%) -- liquidez baja", spread_pct
+                    )
+
+                # 2. Candlesticks + deteccion de regimen
+                candles    = self.client.get_candlesticks(
+                    self.symbol, self.cfg["timeframe"], count=100
+                )
+                df         = self.detector.build_df(candles)
+                new_regime, adx, bbw = self.detector.detect(df, mid)
+
+                # 3. Gestionar regimen
+                if new_regime == REGIME_LATERAL:
+                    if self.regime != REGIME_LATERAL:
+                        self._switch_to_lateral(mid, bid, ask)
+                    elif self.grid.active:
+                        open_ids = {
+                            o["order_id"]
+                            for o in self.client.get_open_orders(self.symbol)
+                        }
+                        self.grid.refresh(mid, open_ids)
+                        if self.grid.check_sl(mid):
+                            self.grid.close()
+                            self.detector.grid_high = None
+                            self.detector.grid_low  = None
+                        else:
+                            log.info(
+                                "[GRID] [%.0f -- %.0f] | Ordenes=%d | "
+                                "PnL neto=%+.4f USDT | Fees=%.4f USDT",
+                                self.grid.grid_low, self.grid.grid_high,
+                                len(self.grid.orders),
+                                self.grid.realized_pnl,
+                                self.grid.total_fees_paid,
+                            )
+
+                elif new_regime in (REGIME_TREND_UP, REGIME_TREND_DN, REGIME_BREAKOUT):
+                    if self.regime == REGIME_LATERAL:
+                        self._switch_to_trend(new_regime)
+
+                    # Comprobar SL/TP sobre mid real
+                    exit_reason = self.trend.check_exit(mid)
+                    if exit_reason:
+                        self.trend.close(mid, bid, ask, reason=exit_reason)
+
+                    # Abrir posicion si no hay ninguna
+                    if not self.trend.position:
+                        balance = self.client.get_balance("USDT")
+
+                        if new_regime == REGIME_BREAKOUT:
+                            if self.grid.grid_high and mid > self.grid.grid_high:
+                                signal = "BUY"
+                            elif self.grid.grid_low and mid < self.grid.grid_low:
+                                signal = "SELL"
+                            else:
+                                signal = "NEUTRAL"
+                            log.info("[BREAKOUT] Senal directa: %s", signal)
+                        else:
+                            signal = self.trend.get_signal(df)
+
+                        if signal in ("BUY", "SELL"):
+                            self.trend.open(signal, mid, bid, ask, balance)
+
+                    # PnL no realizado
+                    if self.trend.position:
+                        pnl = self.trend.unrealized_pnl(mid)
+                        log.info(
+                            "[PNL] [%s] Entry=%.2f | Mid=%.2f | PnL neto~%+.4f USDT",
+                            self.trend.position["side"],
+                            self.trend.position["entry"],
+                            mid, pnl,
+                        )
+
+                self.regime = new_regime
+
+            except KeyboardInterrupt:
+                log.info("[STOP] Detenido manualmente -- cerrando posiciones...")
+                self.running = False
+                try:
+                    mid, bid, ask = self.client.get_mid_price(self.symbol)
+                    if self.grid.active:
+                        self.grid.close()
+                    if self.trend.position:
+                        self.trend.close(mid, bid, ask, reason="MANUAL_STOP")
+                except Exception:
+                    pass
+                total_fees = self.grid.total_fees_paid + self.trend.total_fees_paid
+                log.info(
+                    "[FEE] Fees totales pagadas en esta sesion: %.4f USDT", total_fees
+                )
+                break
+            except Exception as exc:
+                log.error("[FAIL] Error inesperado: %s", exc, exc_info=True)
+
+            log.info("[WAIT] Proximo ciclo en %ds...", self.interval)
+            time.sleep(self.interval)
+
+
+# =============================================================================
+# PUNTO DE ENTRADA
+# =============================================================================
+
+if __name__ == "__main__":
+    bot = AdaptiveGridBot(
+        cfg        = CONFIG,
+        api_client = client,
+        detector   = detector,
+        grid       = grid_engine,
+        trend      = trend_strategy,
+    )
+    bot.run()
