@@ -38,6 +38,8 @@ import hmac
 import hashlib
 import logging
 import math
+import json
+import threading
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -73,9 +75,9 @@ BASE_URL   = "https://api.crypto.com/exchange/v1"
 # -- Parametros del bot --------------------------------------------------------
 CONFIG = {
     # -- General
-    "symbol":               "BTC_USDT",
-    "timeframe":            "5m",
-    "capital_usdt":         1000.0,
+    "symbol":               "BTC_EUR",
+    "timeframe":            "1m",
+    "capital_usdt":         50.0,
 
     # -- Comisiones (fallback si la API no las devuelve)
     "fee_maker":            0.00050,   # 0.050% -> LIMIT
@@ -86,12 +88,12 @@ CONFIG = {
 
     # -- Order book
     "book_depth":           10,
-    "min_liquidity_usdt":   500.0,
+    "min_liquidity_usdt":   50.0,
 
     # -- Deteccion de regimen (ADX + BBW)
     "adx_period":           14,
     "adx_lateral_th":       25,        # ADX < 25  -> lateral
-    "adx_trend_th":         30,        # ADX > 30  -> tendencia
+    "adx_trend_th":         40,        # ADX > 40  -> tendencia
     "bbw_period":           20,
     "bbw_std":              2.0,
     "bbw_squeeze_th":       0.03,      # BBW < 3%  -> squeeze (lateral)
@@ -99,13 +101,16 @@ CONFIG = {
     "regime_lookback":      3,
 
     # -- Grid Trading (modo lateral)
-    "grid_levels":          8,
-    "grid_range_pct":       0.04,      # +/- 2% alrededor del precio central
-    "grid_order_usdt":      50.0,      # USDT por nivel
+    "grid_levels":          6,         # numero maximo de niveles (3 BUY + 3 SELL aprox)
+    "grid_margin_mult":     1.5,       # paso = 2 x fee_maker x multiplicador
+                                       # 1.5 -> ordenes muy cercanas, margen minimo
+                                       # 2.0 -> equilibrio (recomendado para empezar)
+                                       # 3.0 -> ordenes mas lejas, mas margen por ciclo
+    "grid_order_usdt":      10.0,      # USDT por nivel
     "grid_sl_pct":          0.035,     # SL global del grid (3.5% bajo el rango)
 
     # -- Tendencia (RSI + EMA + MACD)
-    "trend_trade_pct":      0.10,      # % del capital por operacion
+    "trend_trade_pct":      0.05,      # % del capital por operacion
     "sl_pct":               0.02,
     "tp_pct":               0.04,
     "rsi_period":           14,
@@ -123,7 +128,7 @@ CONFIG = {
 }
 
 TIMEFRAME_SECONDS = {
-    "1m": 60, "5m": 300, "15m": 900,
+    "1m": 30, "5m": 300, "15m": 900,
     "30m": 1800, "1h": 3600, "4h": 14400,
 }
 
@@ -161,9 +166,9 @@ class CryptoComClient:
         self.session.headers.update({"Content-Type": "application/json"})
 
     # -- Firma HMAC-SHA256 ----------------------------------------------------
-    def _sign(self, method, params, nonce):
+    def _sign(self, method, req_id, params, nonce):
         param_str = "".join(f"{k}{v}" for k, v in sorted(params.items()))
-        payload   = f"{method}{self.api_key}{param_str}{nonce}"
+        payload   = f"{method}{req_id}{self.api_key}{param_str}{nonce}"
         return hmac.new(
             self.api_secret.encode(), payload.encode(), hashlib.sha256
         ).hexdigest()
@@ -171,16 +176,19 @@ class CryptoComClient:
     def _private(self, method, params=None):
         params = params or {}
         nonce  = int(time.time() * 1000)
+        req_id = nonce % 2_000_000_000
         body   = {
-            "id":      nonce,
+            "id":      req_id,
             "method":  method,
             "api_key": self.api_key,
             "params":  params,
             "nonce":   nonce,
-            "sig":     self._sign(method, params, nonce),
+            "sig":     self._sign(method, req_id, params, nonce),
         }
         url  = f"{self.base_url}/private/{method.split('/')[-1]}"
         resp = self.session.post(url, json=body, timeout=10)
+        if not resp.ok:
+            log.error("[FAIL] %s -> %s | body: %s", method, resp.status_code, resp.text[:500])
         resp.raise_for_status()
         data = resp.json()
         if data.get("code") != 0:
@@ -207,7 +215,7 @@ class CryptoComClient:
     def get_ticker(self, symbol):
         """Ticker completo: bid (b), ask (a), last (k), vol 24h (v)."""
         return self._public(
-            "get-ticker", {"instrument_name": symbol}
+            "get-tickers", {"instrument_name": symbol}
         ).get("data", [{}])[0]
 
     def get_mid_price(self, symbol):
@@ -316,19 +324,19 @@ class CryptoComClient:
             return None
 
     def get_balance(self, currency="USDT"):
-        result = self._private(
-            "private/get-account-summary", {"currency": currency}
-        )
-        for acc in result.get("accounts", []):
-            if acc.get("currency") == currency:
-                return float(acc.get("available", 0))
+        result = self._private("private/user-balance", {})
+        positions = result.get("data", [{}])[0].get("position_balances", [])
+        for pos in positions:
+            if pos.get("instrument_name") == currency:
+                return float(pos.get("quantity", 0))
         return 0.0
 
     def get_open_orders(self, symbol):
-        return self._private("private/get-open-orders", {
+        result = self._private("private/get-open-orders", {
             "instrument_name": symbol,
             "page_size":       50,
-        }).get("order_list", [])
+        })
+        return result.get("data", result.get("order_list", []))
 
     # -- Ordenes --------------------------------------------------------------
     def place_order(self, symbol, side, order_type, quantity,
@@ -337,10 +345,10 @@ class CryptoComClient:
             "instrument_name": symbol,
             "side":            side,
             "type":            order_type,
-            "quantity":        str(round(quantity, 6)),
+            "quantity":        f"{math.floor(quantity * 100000) / 100000:.5f}",
         }
         if price and order_type == "LIMIT":
-            params["price"] = str(round(price, 2))
+            params["price"] = f"{price:.2f}"
         if client_oid:
             params["client_oid"] = client_oid
         return self._private("private/create-order", params)
@@ -606,83 +614,132 @@ class GridEngine:
         self.sl_price        = None
         self.realized_pnl    = 0.0
         self.total_fees_paid = 0.0
-
-    def _check_viable(self, n_levels, range_pct):
-        step_pct  = range_pct / (n_levels - 1)
-        breakeven = 2 * self.fees.fee_maker
-        if step_pct <= breakeven:
-            log.warning(
-                "[WARN] [GRID] Inviable: paso=%.4f%% <= breakeven=%.4f%% (2x maker). "
-                "Aumenta grid_range_pct o reduce grid_levels.",
-                step_pct * 100, breakeven * 100,
-            )
-            return False
-        log.info(
-            "[OK] [GRID] Viable: paso=%.4f%% > breakeven=%.4f%% | "
-            "Margen neto por ciclo ~%.4f%%",
-            step_pct * 100, breakeven * 100, (step_pct - breakeven) * 100,
-        )
-        return True
+        self._lock           = threading.Lock()
 
     def setup(self, center_price):
-        if not self._check_viable(self.cfg["grid_levels"], self.cfg["grid_range_pct"]):
-            return False
-        half           = center_price * self.cfg["grid_range_pct"] / 2
+        breakeven = 2 * self.fees.fee_maker
+        step_pct  = breakeven * self.cfg["grid_margin_mult"]
+        step      = round(center_price * step_pct, 2)
+        n         = self.cfg["grid_levels"]
+        margin_pct = step_pct - breakeven
+
         self.center    = center_price
-        self.grid_low  = round(center_price - half, 2)
-        self.grid_high = round(center_price + half, 2)
+        self.grid_low  = round(center_price - step * (n // 2), 2)
+        self.grid_high = round(center_price + step * (n // 2), 2)
         self.sl_price  = round(self.grid_low * (1 - self.cfg["grid_sl_pct"]), 2)
-        step           = (self.grid_high - self.grid_low) / (self.cfg["grid_levels"] - 1)
-        self.levels    = [
-            round(self.grid_low + i * step, 2) for i in range(self.cfg["grid_levels"])
-        ]
+        self.levels    = [round(center_price + step * i, 2)
+                          for i in range(-(n // 2), n // 2 + 1)]
+        self.levels    = sorted(set(self.levels))[:n]
+
         log.info(
-            "[GRID] Configurado: [%.2f -- %.2f] | Centro=%.2f | Paso=%.2f | SL=%.2f",
-            self.grid_low, self.grid_high, center_price, step, self.sl_price,
+            "[GRID] Configurado: [%.2f -- %.2f] | Centro=%.2f | "
+            "Paso=%.2f (%.3f%%) | Margen neto=%.3f%% | SL=%.2f",
+            self.grid_low, self.grid_high, center_price,
+            step, step_pct * 100, margin_pct * 100, self.sl_price,
         )
         return True
 
     def place_initial_orders(self, mid_price):
         """Coloca ordenes LIMIT en todos los niveles segun el mid real."""
-        symbol    = self.cfg["symbol"]
-        order_usd = self.cfg["grid_order_usdt"]
+        symbol       = self.cfg["symbol"]
+        order_usd    = self.cfg["grid_order_usdt"]
+        base_ccy     = symbol.split("_")[0]
+        btc_avail    = self.client.get_balance(base_ccy)
 
         for level in self.levels:
             if abs(level - mid_price) / mid_price < 0.001:
                 continue
-            side   = "BUY" if level < mid_price else "SELL"
-            costs  = self.fees.calc_entry_cost(order_usd, level, "LIMIT")
+            side  = "BUY" if level < mid_price else "SELL"
+            costs = self.fees.calc_entry_cost(order_usd, level, "LIMIT")
+
+            if side == "SELL":
+                if btc_avail < costs["qty"] * 0.999:
+                    log.info("[GRID] SELL @ %.2f omitida -- sin %s disponible", level, base_ccy)
+                    continue
+                sell_qty   = min(costs["qty"], btc_avail)
+                btc_avail -= sell_qty  # reservar para la siguiente SELL
+            else:
+                sell_qty = costs["qty"]
+
             try:
                 result = self.client.place_order(
-                    symbol, side, "LIMIT", costs["qty"], price=level,
+                    symbol, side, "LIMIT", sell_qty, price=level,
                     client_oid=f"grid_{side}_{int(level)}_{int(time.time())}",
                 )
                 oid = result.get("order_id", "")
                 self.orders[oid] = {
                     "level":    level,
                     "side":     side,
-                    "qty":      costs["qty"],
+                    "qty":      sell_qty,
                     "fee_usdt": costs["fee_usdt"],
                 }
                 log.info(
-                    "[ORDER] %s LIMIT @ %.2f | Qty=%.6f | Fee=%.4f USDT [maker]",
-                    side, level, costs["qty"], costs["fee_usdt"],
+                    "[ORDER] %s LIMIT @ %.2f | Qty=%.6f | Fee=%.4f EUR [maker]",
+                    side, level, sell_qty, costs["fee_usdt"],
                 )
             except Exception as exc:
-                log.error("[FAIL] Orden grid @ %.2f: %s", level, exc)
+                log.info("[GRID] %s @ %.2f omitida -- %s", side, level, exc)
 
         self.active = True
 
+    def _place_counter_order(self, symbol, order, next_level, next_side, order_usd):
+        """Coloca la orden contraria tras un fill. Devuelve True si tuvo exito."""
+        base_ccy   = symbol.split("_")[0]
+        next_costs = self.fees.calc_entry_cost(order_usd, next_level, "LIMIT")
+        sell_qty   = next_costs["qty"]
+        if next_side == "SELL":
+            avail = self.client.get_balance(base_ccy)
+            if avail <= 0:
+                log.info("[GRID] SELL @ %.2f omitida -- sin %s", next_level, base_ccy)
+                return False
+            sell_qty = min(sell_qty, avail)
+        try:
+            result = self.client.place_order(
+                symbol, next_side, "LIMIT", sell_qty, price=next_level,
+                client_oid=f"grid_{next_side}_{int(next_level)}_{int(time.time())}",
+            )
+            new_id = result.get("order_id", "")
+            self.orders[new_id] = {
+                "level":    next_level,
+                "side":     next_side,
+                "qty":      sell_qty,
+                "fee_entry": next_costs["fee_usdt"],
+                "fee_usdt": next_costs["fee_usdt"],
+                "pair_entry_level": order["level"],
+                "pair_entry_side":  order["side"],
+                "pair_entry_qty":   order["qty"],
+                "pair_entry_fee":   order.get("fee_entry", order["fee_usdt"]),
+            }
+            log.info("[ORDER] %s LIMIT @ %.2f [contraria]", next_side, next_level)
+            return True
+        except Exception as exc:
+            log.error("[FAIL] Orden contraria @ %.2f: %s", next_level, exc)
+            return False
+
+    def _calc_pnl(self, order):
+        """Calcula PnL neto cuando se cierra un ciclo completo BUY+SELL."""
+        if "pair_entry_level" not in order:
+            return None
+        entry_level = order["pair_entry_level"]
+        exit_level  = order["level"]
+        qty         = order["pair_entry_qty"]
+        fee_in      = order["pair_entry_fee"]
+        fee_out     = order.get("fee_entry", order["fee_usdt"])
+        pnl         = (exit_level - entry_level) * qty - fee_in - fee_out
+        return round(pnl, 6)
+
     def refresh(self, mid_price, open_order_ids):
-        """Detecta ordenes ejecutadas y coloca la contraria."""
+        """Detecta ordenes ejecutadas por polling (fallback al WS)."""
         if not self.active:
             return
         symbol    = self.cfg["symbol"]
         order_usd = self.cfg["grid_order_usdt"]
-        executed  = {oid: o for oid, o in self.orders.items()
+        executed  = {oid: o for oid, o in list(self.orders.items())
                      if oid not in open_order_ids}
 
         for oid, order in executed.items():
+            if oid not in self.orders:
+                continue  # ya procesado por WS
             level = order["level"]
             side  = order["side"]
             try:
@@ -699,38 +756,56 @@ class GridEngine:
                 del self.orders[oid]
                 continue
 
-            fee_exit   = self.fees.calc_exit_cost(order["qty"], next_level, "LIMIT")
-            cycle_pnl  = (abs(next_level - level) * order["qty"]
-                          - order["fee_usdt"] - fee_exit["fee_usdt"])
-            self.realized_pnl    += cycle_pnl
-            self.total_fees_paid += order["fee_usdt"] + fee_exit["fee_usdt"]
+            # PnL solo al cerrar ciclo completo: SELL ejecutada con par de BUY
+            if side == "SELL" and "pair_entry_level" in order:
+                pnl = self._calc_pnl(order)
+                if pnl is not None:
+                    self.realized_pnl    += pnl
+                    self.total_fees_paid += order["pair_entry_fee"] + order.get("fee_entry", order["fee_usdt"])
+                    log.info("[OK] [GRID] Ciclo BUY@%.2f->SELL@%.2f | PnL=%+.4f EUR | Acumulado=%+.4f EUR",
+                             order["pair_entry_level"], level, pnl, self.realized_pnl)
 
-            log.info(
-                "[OK] [GRID] Ejecutada %s @ %.2f | PnL ciclo neto=%+.4f USDT | "
-                "Acumulado=%+.4f USDT",
-                side, level, cycle_pnl, self.realized_pnl,
-            )
-
-            next_costs = self.fees.calc_entry_cost(order_usd, next_level, "LIMIT")
-            try:
-                result = self.client.place_order(
-                    symbol, next_side, "LIMIT", next_costs["qty"], price=next_level,
-                    client_oid=f"grid_{next_side}_{int(next_level)}_{int(time.time())}",
-                )
-                new_id = result.get("order_id", "")
-                self.orders[new_id] = {
-                    "level":    next_level,
-                    "side":     next_side,
-                    "qty":      next_costs["qty"],
-                    "fee_usdt": next_costs["fee_usdt"],
-                }
-                log.info(
-                    "[ORDER] %s LIMIT @ %.2f [maker]", next_side, next_level
-                )
-            except Exception as exc:
-                log.error("[FAIL] Orden contraria @ %.2f: %s", next_level, exc)
-
+            self._place_counter_order(symbol, order, next_level, next_side, order_usd)
             del self.orders[oid]
+
+    def handle_fill_realtime(self, order_id, side, _price, _qty):
+        """Callback del WebSocket: reacciona a un fill inmediatamente."""
+        with self._lock:
+            order = self.orders.get(order_id)
+            if not order or not self.active:
+                return
+            level     = order["level"]
+            symbol    = self.cfg["symbol"]
+            order_usd = self.cfg["grid_order_usdt"]
+            try:
+                idx = self.levels.index(level)
+            except ValueError:
+                del self.orders[order_id]
+                return
+
+            if side == "BUY" and idx + 1 < len(self.levels):
+                next_level, next_side = self.levels[idx + 1], "SELL"
+            elif side == "SELL" and idx - 1 >= 0:
+                next_level, next_side = self.levels[idx - 1], "BUY"
+            else:
+                del self.orders[order_id]
+                return
+
+            # PnL solo al cerrar ciclo completo: SELL con par de BUY registrado
+            if side == "SELL" and "pair_entry_level" in order:
+                pnl = self._calc_pnl(order)
+                if pnl is not None:
+                    self.realized_pnl    += pnl
+                    self.total_fees_paid += order["pair_entry_fee"] + order.get("fee_entry", order["fee_usdt"])
+                    log.info("[WS] [OK] Ciclo BUY@%.2f->SELL@%.2f | PnL=%+.4f EUR | Acumulado=%+.4f EUR",
+                             order["pair_entry_level"], level, pnl, self.realized_pnl)
+            else:
+                log.info("[WS] Fill %s @ %.2f detectado", side, level)
+
+            if next_side == "SELL":
+                time.sleep(0.5)  # esperar liquidacion del fill en la cuenta
+            self._place_counter_order(symbol, order, next_level, next_side, order_usd)
+            del self.orders[order_id]
 
     def check_sl(self, mid_price):
         """SL global del grid evaluado sobre el mid real del ticker."""
@@ -825,12 +900,15 @@ class TrendStrategy:
             return
 
         trade_usdt = capital * self.cfg["trend_trade_pct"]
+        if trade_usdt <= 0:
+            log.warning("[WARN] Capital insuficiente para operar en tendencia (%.4f)", trade_usdt)
+            return
 
         # 1. Estimar slippage desde el order book
         exec_price, slip_pct, slip_ok = self.client.estimate_slippage(
             self.cfg["symbol"], signal, trade_usdt, self.cfg["max_slippage_pct"]
         )
-        if not slip_ok:
+        if not slip_ok or exec_price <= 0:
             log.warning(
                 "[WARN] Slippage excesivo (%.3f%%) -- orden abortada", slip_pct * 100
             )
@@ -951,7 +1029,119 @@ log.info("[OK] Bloque 5 cargado -- Estrategia de tendencia lista")
 
 
 # =============================================================================
-# BLOQUE 6 -- ORQUESTADOR PRINCIPAL (BUCLE ADAPTATIVO)
+# BLOQUE 6 -- FILL LISTENER (WEBSOCKET TIEMPO REAL)
+# =============================================================================
+
+class FillListener:
+    """
+    Escucha ejecuciones de ordenes en tiempo real via WebSocket privado.
+    Cuando detecta un fill llama a grid.handle_fill_realtime() inmediatamente.
+    Se reconecta automaticamente si cae la conexion.
+    """
+    WS_URL = "wss://stream.crypto.com/exchange/v1/user"
+
+    def __init__(self, api_key, api_secret, symbol, grid):
+        self.api_key    = api_key
+        self.api_secret = api_secret
+        self.symbol     = symbol
+        self.grid       = grid
+        self._ws        = None
+        self._authed    = False
+        self._active    = True
+
+    def _sign(self, req_id, nonce):
+        payload = f"public/auth{req_id}{self.api_key}{nonce}"
+        return hmac.new(
+            self.api_secret.encode(), payload.encode(), hashlib.sha256
+        ).hexdigest()
+
+    def _send(self, msg):
+        try:
+            if self._ws:
+                self._ws.send(json.dumps(msg))
+        except Exception:
+            pass
+
+    def _on_open(self, _ws):
+        self._authed = False
+        nonce  = int(time.time() * 1000)
+        req_id = nonce % 2_000_000_000
+        self._send({
+            "id":      req_id,
+            "method":  "public/auth",
+            "api_key": self.api_key,
+            "nonce":   nonce,
+            "sig":     self._sign(req_id, nonce),
+        })
+
+    def _on_message(self, ws, message):
+        try:
+            data = json.loads(message)
+        except Exception:
+            return
+
+        method = data.get("method", "")
+
+        if method == "public/heartbeat":
+            self._send({"id": data["id"], "method": "public/respond-heartbeat"})
+            return
+
+        # Respuesta al auth -> suscribirse
+        if not self._authed and data.get("code") == 0 and data.get("id"):
+            self._authed = True
+            self._send({
+                "id":     1,
+                "method": "subscribe",
+                "params": {"channels": [f"user.order.{self.symbol}"]},
+            })
+            log.info("[WS] Suscrito a fills de %s", self.symbol)
+            return
+
+        # Evento de fill
+        if method == "subscribe":
+            for order in data.get("result", {}).get("data", []):
+                if order.get("status") in ("FILLED", "PARTIALLY_FILLED"):
+                    self.grid.handle_fill_realtime(
+                        order.get("order_id", ""),
+                        order.get("side", ""),
+                        float(order.get("price", 0)),
+                        float(order.get("cumulative_quantity", order.get("quantity", 0))),
+                    )
+
+    def _on_error(self, ws, error):
+        log.warning("[WS] Error: %s", error)
+
+    def _on_close(self, ws, *args):
+        if self._active:
+            log.warning("[WS] Conexion cerrada -- reconectando en 5s...")
+            time.sleep(5)
+            self._connect()
+
+    def _connect(self):
+        import websocket as _wslib
+        self._ws = _wslib.WebSocketApp(
+            self.WS_URL,
+            on_open=self._on_open,
+            on_message=self._on_message,
+            on_error=self._on_error,
+            on_close=self._on_close,
+        )
+        t = threading.Thread(target=self._ws.run_forever, daemon=True)
+        t.start()
+
+    def start(self):
+        self._active = True
+        self._connect()
+        log.info("[WS] FillListener iniciado")
+
+    def stop(self):
+        self._active = False
+        if self._ws:
+            self._ws.close()
+
+
+# =============================================================================
+# BLOQUE 7 -- ORQUESTADOR PRINCIPAL (BUCLE ADAPTATIVO)
 # =============================================================================
 
 class AdaptiveGridBot:
@@ -977,6 +1167,9 @@ class AdaptiveGridBot:
         self.interval = TIMEFRAME_SECONDS.get(cfg["timeframe"], 300)
         self.regime   = None
         self.running  = False
+        self.fill_listener = FillListener(
+            API_KEY, API_SECRET, self.symbol, self.grid
+        )
 
     def _switch_to_lateral(self, mid, bid, ask):
         if self.trend.position:
@@ -1003,6 +1196,7 @@ class AdaptiveGridBot:
             self.symbol, self.cfg["timeframe"],
         )
         self.running = True
+        self.fill_listener.start()
 
         while self.running:
             try:
@@ -1036,7 +1230,13 @@ class AdaptiveGridBot:
                             o["order_id"]
                             for o in self.client.get_open_orders(self.symbol)
                         }
-                        self.grid.refresh(mid, open_ids)
+                        # Reconstruir si no hay ordenes (canceladas externamente o todas ejecutadas)
+                        if not open_ids and not self.grid.orders:
+                            log.info("[GRID] Grid vacio -- reconstruyendo...")
+                            self.grid.active = False
+                            self._switch_to_lateral(mid, bid, ask)
+                        else:
+                            self.grid.refresh(mid, open_ids)
                         if self.grid.check_sl(mid):
                             self.grid.close()
                             self.detector.grid_high = None
@@ -1062,7 +1262,7 @@ class AdaptiveGridBot:
 
                     # Abrir posicion si no hay ninguna
                     if not self.trend.position:
-                        balance = self.client.get_balance("USDT")
+                        balance = self.client.get_balance("EUR")
 
                         if new_regime == REGIME_BREAKOUT:
                             if self.grid.grid_high and mid > self.grid.grid_high:
@@ -1093,6 +1293,7 @@ class AdaptiveGridBot:
             except KeyboardInterrupt:
                 log.info("[STOP] Detenido manualmente -- cerrando posiciones...")
                 self.running = False
+                self.fill_listener.stop()
                 try:
                     mid, bid, ask = self.client.get_mid_price(self.symbol)
                     if self.grid.active:
