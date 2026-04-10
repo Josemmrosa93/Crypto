@@ -98,7 +98,7 @@ CONFIG = {
     "bbw_std":              2.0,
     "bbw_squeeze_th":       0.03,      # BBW < 3%  -> squeeze (lateral)
     "bbw_expand_th":        0.06,      # BBW > 6%  -> expansion (tendencia)
-    "regime_lookback":      3,
+    "regime_lookback":      5,
 
     # -- Grid Trading (modo lateral)
     "grid_levels":          6,         # numero maximo de niveles (3 BUY + 3 SELL aprox)
@@ -561,7 +561,7 @@ class RegimeDetector:
 
         if breakout:
             regime = REGIME_BREAKOUT
-        elif adx_trending or bbw_expand:
+        elif adx_trending and bbw_expand:
             regime = REGIME_TREND_UP if trend_up else REGIME_TREND_DN
         elif adx_lateral and bbw_squeeze:
             regime = REGIME_LATERAL
