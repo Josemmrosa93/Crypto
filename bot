@@ -96,13 +96,13 @@ CONFIG = {
     "adx_trend_th":         40,        # ADX > 40  -> tendencia
     "bbw_period":           20,
     "bbw_std":              2.0,
-    "bbw_squeeze_th":       0.03,      # BBW < 3%  -> squeeze (lateral)
-    "bbw_expand_th":        0.06,      # BBW > 6%  -> expansion (tendencia)
+    "bbw_squeeze_th":       0.002,     # BBW < 0.2% -> squeeze (lateral)
+    "bbw_expand_th":        0.005,     # BBW > 0.5% -> expansion (tendencia)
     "regime_lookback":      5,
 
     # -- Grid Trading (modo lateral)
     "grid_levels":          6,         # numero maximo de niveles (3 BUY + 3 SELL aprox)
-    "grid_margin_mult":     1.5,       # paso = 2 x fee_maker x multiplicador
+    "grid_margin_mult":     2.0,       # paso = 2 x fee_maker x multiplicador
                                        # 1.5 -> ordenes muy cercanas, margen minimo
                                        # 2.0 -> equilibrio (recomendado para empezar)
                                        # 3.0 -> ordenes mas lejas, mas margen por ciclo
@@ -619,53 +619,56 @@ class GridEngine:
     def setup(self, center_price, eur_avail=None, btc_avail=None):
         breakeven  = 2 * self.fees.fee_maker
         step_pct   = breakeven * self.cfg["grid_margin_mult"]
-        step       = round(center_price * step_pct, 2)
         n          = self.cfg["grid_levels"]
         margin_pct = step_pct - breakeven
 
-        # Opcion 2: desplazar el centro segun balance disponible
-        # Si solo hay BTC (no EUR), subir el centro para que los niveles sean SELL
-        # Si solo hay EUR (no BTC), bajar el centro para que los niveles sean BUY
+        # Desplazar el centro segun balance disponible.
+        # Con progresion geometrica el desplazamiento es multiplicativo:
+        #   centro_nuevo = centro * (1 + paso%)^niveles
         adjusted_center = center_price
         if eur_avail is not None and btc_avail is not None:
             order_usd    = self.cfg["grid_order_usdt"]
-            eur_per_buy  = order_usd                        # EUR que cuesta una BUY
-            btc_per_sell = order_usd / center_price         # BTC que cuesta una SELL
-            max_buys     = int(eur_avail / eur_per_buy)     # cuantas BUY podemos poner
-            max_sells    = int(btc_avail / btc_per_sell)    # cuantas SELL podemos poner
+            eur_per_buy  = order_usd
+            btc_per_sell = order_usd / center_price
+            max_buys     = int(eur_avail / eur_per_buy)
+            max_sells    = int(btc_avail / btc_per_sell)
             half         = n // 2
-            # Si el balance esta muy ladeado, desplazar el centro
             if max_buys == 0 and max_sells > 0:
                 # Solo BTC: subir centro para que todos los niveles sean SELL
-                adjusted_center = round(center_price + step * half, 2)
+                adjusted_center = round(center_price * (1 + step_pct)**half, 2)
                 log.info("[GRID] Balance: solo BTC disponible -- centro desplazado hacia arriba %.2f -> %.2f",
                          center_price, adjusted_center)
             elif max_sells == 0 and max_buys > 0:
                 # Solo EUR: bajar centro para que todos los niveles sean BUY
-                adjusted_center = round(center_price - step * half, 2)
+                adjusted_center = round(center_price * (1 + step_pct)**(-half), 2)
                 log.info("[GRID] Balance: solo EUR disponible -- centro desplazado hacia abajo %.2f -> %.2f",
                          center_price, adjusted_center)
             elif max_buys < half or max_sells < half:
                 # Balance parcialmente ladeado: desplazar proporcionalmente
-                shift = (max_sells - max_buys) * step // 2
-                adjusted_center = round(center_price + shift, 2)
-                if shift != 0:
+                shift_levels    = (max_sells - max_buys) // 2
+                adjusted_center = round(center_price * (1 + step_pct)**shift_levels, 2)
+                if shift_levels != 0:
                     log.info("[GRID] Balance parcial (BUY=%d SELL=%d) -- centro ajustado %.2f -> %.2f",
                              max_buys, max_sells, center_price, adjusted_center)
 
-        self.center    = adjusted_center
-        self.grid_low  = round(adjusted_center - step * (n // 2), 2)
-        self.grid_high = round(adjusted_center + step * (n // 2), 2)
-        self.sl_price  = round(self.grid_low * (1 - self.cfg["grid_sl_pct"]), 2)
-        self.levels    = [round(adjusted_center + step * i, 2)
-                          for i in range(-(n // 2), n // 2 + 1)]
-        self.levels    = sorted(set(self.levels))[:n]
+        self.center = adjusted_center
 
+        # Progresion geometrica: nivel[i] = centro * (1 + paso%)^i
+        # Cada nivel esta exactamente step_pct% por encima/debajo del anterior,
+        # independientemente del precio absoluto.
+        raw_levels     = [round(adjusted_center * (1 + step_pct)**i, 2)
+                          for i in range(-(n // 2), n // 2 + 1)]
+        self.levels    = sorted(set(raw_levels))[:n]
+        self.grid_low  = min(self.levels)
+        self.grid_high = max(self.levels)
+        self.sl_price  = round(self.grid_low * (1 - self.cfg["grid_sl_pct"]), 2)
+
+        step_ref = round(adjusted_center * step_pct, 2)   # paso en EUR al precio central
         log.info(
-            "[GRID] Configurado: [%.2f -- %.2f] | Centro=%.2f | "
-            "Paso=%.2f (%.3f%%) | Margen neto=%.3f%% | SL=%.2f",
+            "[GRID] Configurado (geometrico): [%.2f -- %.2f] | Centro=%.2f | "
+            "Paso~%.2f (%.3f%%) | Margen neto=%.3f%% | SL=%.2f",
             self.grid_low, self.grid_high, adjusted_center,
-            step, step_pct * 100, margin_pct * 100, self.sl_price,
+            step_ref, step_pct * 100, margin_pct * 100, self.sl_price,
         )
         return True
 
@@ -870,6 +873,55 @@ class GridEngine:
             return True
         return False
 
+    def liquidate(self, mid_price):
+        """
+        SL real: cancela todas las ordenes del grid y vende todo el BTC
+        disponible con una orden MARKET (fee taker).
+
+        A diferencia de close(), esta funcion protege el capital convirtiendo
+        el inventario de BTC a EUR antes de que siga depreciandose.
+        Se llama exclusivamente cuando check_sl() devuelve True.
+        """
+        base_ccy = self.cfg["symbol"].split("_")[0]
+
+        # 1. Cancelar ordenes pendientes del grid
+        try:
+            self.client.cancel_all_orders(self.cfg["symbol"])
+        except Exception as exc:
+            log.error("[FAIL] Cancelando ordenes en liquidacion SL: %s", exc)
+
+        # 2. Obtener el BTC real disponible y venderlo a mercado
+        btc_qty = self.client.get_balance(base_ccy)
+        if btc_qty > 0:
+            fee_eur = round(btc_qty * mid_price * self.fees.fee_taker, 4)
+            try:
+                self.client.place_order(
+                    self.cfg["symbol"], "SELL", "MARKET", btc_qty,
+                    client_oid=f"sl_liq_{int(time.time())}",
+                )
+                log.warning(
+                    "[STOP] [SL] Liquidacion ejecutada | SELL %.6f %s @ ~%.2f "
+                    "| Fee taker=%.4f EUR (%.3f%%)",
+                    btc_qty, base_ccy, mid_price,
+                    fee_eur, self.fees.fee_taker * 100,
+                )
+            except Exception as exc:
+                log.error("[FAIL] Venta SL fallida -- %s no liquidado: %s", base_ccy, exc)
+        else:
+            log.info(
+                "[STOP] [SL] Sin %s disponible -- solo se cancelan ordenes", base_ccy
+            )
+
+        # 3. Reset del estado del grid
+        log.info(
+            "[CLOSE] [GRID] SL ejecutado | PnL grid=%+.4f EUR | Fees=%.4f EUR",
+            self.realized_pnl, self.total_fees_paid,
+        )
+        self.orders          = {}
+        self.active          = False
+        self.realized_pnl    = 0.0
+        self.total_fees_paid = 0.0
+
     def close(self):
         try:
             self.client.cancel_all_orders(self.cfg["symbol"])
@@ -909,6 +961,7 @@ class TrendStrategy:
         self.fees            = fee_calc
         self.position        = None
         self.total_fees_paid = 0.0
+        self.realized_pnl    = 0.0    # acumulado global de sesion (nunca se resetea)
 
     def _indicators(self, df):
         c     = df["c"]
@@ -1049,6 +1102,7 @@ class TrendStrategy:
         total_fees = self.position["fee_entry"] + exit_costs["fee_usdt"]
         net_pnl    = gross - total_fees
         self.total_fees_paid += exit_costs["fee_usdt"]
+        self.realized_pnl    += net_pnl
 
         tag = "[OK]" if reason == "TP" else "[FAIL]" if reason == "SL" else "[INFO]"
         try:
@@ -1222,8 +1276,15 @@ class AdaptiveGridBot:
         self.fill_listener = FillListener(
             API_KEY, API_SECRET, self.symbol, self.grid
         )
+        # PnL acumulado de sesion (suma de todos los grids ya cerrados)
+        self.session_grid_pnl   = 0.0
+        # Timeout de BREAKOUT-NEUTRAL: si el bot lleva N ciclos sin senal
+        # BUY/SELL en modo BREAKOUT, fuerza el retorno a LATERAL
+        self._neutral_streak    = 0
+        self._neutral_timeout   = 10   # ~5 min con ciclo de 30s
 
     def _switch_to_lateral(self, mid, bid, ask):
+        self._neutral_streak = 0
         if self.trend.position:
             log.info("[SWITCH] TREND -> LATERAL | Cerrando posicion...")
             self.trend.close(mid, bid, ask, reason="REGIME_CHANGE")
@@ -1242,6 +1303,7 @@ class AdaptiveGridBot:
     def _switch_to_trend(self, new_regime):
         if self.grid.active:
             log.info("[SWITCH] LATERAL -> %s | Cerrando grid...", new_regime)
+            self.session_grid_pnl += self.grid.realized_pnl
             self.grid.close()
             self.detector.grid_high = None
             self.detector.grid_low  = None
@@ -1295,7 +1357,8 @@ class AdaptiveGridBot:
                         else:
                             self.grid.refresh(mid, open_ids)
                         if self.grid.check_sl(mid):
-                            self.grid.close()
+                            self.session_grid_pnl += self.grid.realized_pnl
+                            self.grid.liquidate(mid)
                             self.detector.grid_high = None
                             self.detector.grid_low  = None
                         else:
@@ -1310,6 +1373,7 @@ class AdaptiveGridBot:
 
                 elif new_regime in (REGIME_TREND_UP, REGIME_TREND_DN, REGIME_BREAKOUT):
                     # Calcular senal ANTES de decidir si cerrar el grid
+                    return_to_lateral = False
                     if new_regime == REGIME_BREAKOUT:
                         if self.grid.grid_high and mid > self.grid.grid_high:
                             signal = "BUY"
@@ -1318,38 +1382,66 @@ class AdaptiveGridBot:
                         else:
                             signal = "NEUTRAL"
                         log.info("[BREAKOUT] Senal directa: %s", signal)
+
+                        # Timeout NEUTRAL: N ciclos consecutivos sin senal -> LATERAL
+                        if signal == "NEUTRAL":
+                            self._neutral_streak += 1
+                            log.info(
+                                "[BREAKOUT] NEUTRAL consecutivo: %d/%d ciclos%s",
+                                self._neutral_streak, self._neutral_timeout,
+                                " -- forzando LATERAL" if self._neutral_streak >= self._neutral_timeout else "",
+                            )
+                            if self._neutral_streak >= self._neutral_timeout:
+                                self._switch_to_lateral(mid, bid, ask)
+                                new_regime = REGIME_LATERAL
+                                return_to_lateral = True
+                        else:
+                            self._neutral_streak = 0
                     else:
                         signal = self.trend.get_signal(df)
+                        self._neutral_streak = 0
 
-                    # Opcion 3: solo cerrar el grid si hay senal viable que ejecutar
-                    if self.regime == REGIME_LATERAL:
-                        if signal in ("BUY", "SELL"):
-                            self._switch_to_trend(new_regime)
-                        else:
+                    if not return_to_lateral:
+                        # Solo cerrar el grid si hay senal viable que ejecutar
+                        if self.regime == REGIME_LATERAL:
+                            if signal in ("BUY", "SELL"):
+                                self._switch_to_trend(new_regime)
+                            else:
+                                log.info(
+                                    "[%s] Sin senal viable -- manteniendo grid activo",
+                                    new_regime,
+                                )
+
+                        # Comprobar SL/TP sobre mid real
+                        exit_reason = self.trend.check_exit(mid)
+                        if exit_reason:
+                            self.trend.close(mid, bid, ask, reason=exit_reason)
+
+                        # Abrir posicion si no hay ninguna
+                        if not self.trend.position and signal in ("BUY", "SELL"):
+                            balance = self.client.get_balance("EUR")
+                            self.trend.open(signal, mid, bid, ask, balance)
+
+                        # PnL no realizado
+                        if self.trend.position:
+                            pnl = self.trend.unrealized_pnl(mid)
                             log.info(
-                                "[%s] Sin senal viable -- manteniendo grid activo",
-                                new_regime,
+                                "[PNL] [%s] Entry=%.2f | Mid=%.2f | PnL neto~%+.4f USDT",
+                                self.trend.position["side"],
+                                self.trend.position["entry"],
+                                mid, pnl,
                             )
 
-                    # Comprobar SL/TP sobre mid real
-                    exit_reason = self.trend.check_exit(mid)
-                    if exit_reason:
-                        self.trend.close(mid, bid, ask, reason=exit_reason)
-
-                    # Abrir posicion si no hay ninguna
-                    if not self.trend.position and signal in ("BUY", "SELL"):
-                        balance = self.client.get_balance("EUR")
-                        self.trend.open(signal, mid, bid, ask, balance)
-
-                    # PnL no realizado
-                    if self.trend.position:
-                        pnl = self.trend.unrealized_pnl(mid)
-                        log.info(
-                            "[PNL] [%s] Entry=%.2f | Mid=%.2f | PnL neto~%+.4f USDT",
-                            self.trend.position["side"],
-                            self.trend.position["entry"],
-                            mid, pnl,
-                        )
+                # PnL acumulado de sesion (se imprime cada ciclo)
+                session_total = (self.session_grid_pnl
+                                 + self.grid.realized_pnl
+                                 + self.trend.realized_pnl)
+                log.info(
+                    "[SESSION] PnL acumulado: %+.4f USDT  "
+                    "(grids cerrados=%+.4f | grid activo=%+.4f | tendencia=%+.4f)",
+                    session_total, self.session_grid_pnl,
+                    self.grid.realized_pnl, self.trend.realized_pnl,
+                )
 
                 self.regime = new_regime
 
@@ -1360,14 +1452,19 @@ class AdaptiveGridBot:
                 try:
                     mid, bid, ask = self.client.get_mid_price(self.symbol)
                     if self.grid.active:
+                        self.session_grid_pnl += self.grid.realized_pnl
                         self.grid.close()
                     if self.trend.position:
                         self.trend.close(mid, bid, ask, reason="MANUAL_STOP")
                 except Exception:
                     pass
-                total_fees = self.grid.total_fees_paid + self.trend.total_fees_paid
+                session_total = self.session_grid_pnl + self.trend.realized_pnl
+                total_fees    = self.grid.total_fees_paid + self.trend.total_fees_paid
                 log.info(
-                    "[FEE] Fees totales pagadas en esta sesion: %.4f USDT", total_fees
+                    "[SESSION] PnL total de sesion: %+.4f USDT  "
+                    "(grids=%+.4f | tendencia=%+.4f) | Fees totales=%.4f USDT",
+                    session_total, self.session_grid_pnl,
+                    self.trend.realized_pnl, total_fees,
                 )
                 break
             except Exception as exc:
